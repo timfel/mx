@@ -1010,7 +1010,7 @@ class JARDistribution(Distribution, ClasspathDependency):
         self.allowsJavadocWarnings = allowsJavadocWarnings
         self.maven = maven
         if stripConfigFileNames:
-            self.stripConfig = [join(join(suite.mxDir, 'proguard'), stripConfigFileName + '.proguard') for stripConfigFileName in stripConfigFileNames]
+            self.stripConfig = [join(suite.mxDir, 'proguard', stripConfigFileName + '.proguard') for stripConfigFileName in stripConfigFileNames]
         else:
             self.stripConfig = None
         assert path.endswith(self.localExtension())
@@ -1032,7 +1032,7 @@ class JARDistribution(Distribution, ClasspathDependency):
         return [self.original_path(), self._stripped_path(), self.strip_mapping_file()]
 
     def is_stripped(self):
-        return _opts.strip_jars and not self.stripConfig is None
+        return _opts.strip_jars and self.stripConfig is not None
 
     def set_archiveparticipant(self, archiveparticipant):
         """
@@ -1055,7 +1055,7 @@ class JARDistribution(Distribution, ClasspathDependency):
                 Called just before the `services` are written to the binary archive and both archives are
                 written to their underlying files.
         """
-        if not archiveparticipant in self.archiveparticipants:
+        if archiveparticipant not in self.archiveparticipants:
             if not hasattr(archiveparticipant, '__opened__'):
                 abort(str(archiveparticipant) + ' must define __opened__')
             self.archiveparticipants.append(archiveparticipant)
@@ -1278,9 +1278,13 @@ class JARDistribution(Distribution, ClasspathDependency):
             self.strip_jar()
 
     _strip_map_file_suffix = '.map'
+    _strip_cfg_deps_file_suffix = '.conf.d'
 
     def strip_mapping_file(self):
         return self._stripped_path() + JARDistribution._strip_map_file_suffix
+
+    def strip_config_dependency_file(self):
+        return self._stripped_path() + JARDistribution._strip_cfg_deps_file_suffix
 
     def strip_jar(self):
         assert _opts.strip_jars, "Only works under the flag --strip-jars"
@@ -1290,10 +1294,10 @@ class JARDistribution(Distribution, ClasspathDependency):
         with tempfile.NamedTemporaryFile(delete=False, suffix=JARDistribution._strip_map_file_suffix) as config_tmp_file:
             with tempfile.NamedTemporaryFile(delete=False, suffix=JARDistribution._strip_map_file_suffix) as mapping_tmp_file:
                 # add config files from projects
-                strip_config_paths = [join(self.suite.dir, f) for f in self.stripConfig]
+                assert all((os.path.isabs(f) for f in self.stripConfig))
 
                 # add configs (must be one file)
-                _merge_file_contents(strip_config_paths, config_tmp_file)
+                _merge_file_contents(self.stripConfig, config_tmp_file)
                 strip_command += ['-include', config_tmp_file.name]
 
                 # input and output jars
@@ -1323,10 +1327,14 @@ class JARDistribution(Distribution, ClasspathDependency):
                     strip_command += ['-applymapping', mapping_tmp_file.name]
 
 
-                if _opts.verbose:
+                if _opts.very_verbose:
                     strip_command.append('-verbose')
+                elif not _opts.verbose:
+                    strip_command += ['-dontnote', '**']
 
                 run_java(strip_command)
+                with open(self.strip_config_dependency_file(), 'w') as f:
+                    f.writelines((l + os.linesep for l in self.stripConfig))
 
     def remoteName(self):
         base_name = super(JARDistribution, self).remoteName()
@@ -1363,6 +1371,18 @@ class JARDistribution(Distribution, ClasspathDependency):
                 ts = TimeStampFile(moduleJar)
                 if ts.isOlderThan(self.path):
                     return '{} is older than {}'.format(ts, self.path)
+        if self.is_stripped():
+            previous_strip_configs = []
+            dependency_file = self.strip_config_dependency_file()
+            if exists(dependency_file):
+                with open(dependency_file) as f:
+                    previous_strip_configs = (l.rstrip('\r\n') for l in f.readlines())
+            if set(previous_strip_configs) != set(self.stripConfig):
+                return 'strip config files changed'
+            for f in self.stripConfig:
+                ts = TimeStampFile(f)
+                if ts.isNewerThan(self.path):
+                    return '{} is newer than {}'.format(ts, self.path)
         return None
 
 class ArchiveTask(BuildTask):
@@ -2590,7 +2610,18 @@ class JavacCompiler(JavacLikeCompiler):
                 javacArgs.extend(['-classpath', os.pathsep.join(elements)])
 
         if jdk.javaCompliance >= '9':
-            unsafe_jar = _get_jdk_module_classes_jar('jdk.unsupported', primary_suite(), jdk, 'sun.misc.Unsafe')
+            unsafe_jar = join(_mx_home, 'jdk' + str(compliance.value) + '-unsafe.jar')
+            unsafe_source = join(_mx_home, 'Unsafe.java')
+            if not exists(unsafe_jar) or getmtime(unsafe_jar) < getmtime(unsafe_source):
+                tmpdir = tempfile.mkdtemp()
+                try:
+                    subprocess.check_call([jdk.javac, '--release', str(compliance.value), '-d', tmpdir, unsafe_source])
+                    subprocess.check_call([jdk.jar, 'cfM', unsafe_jar, '-C', tmpdir, 'sun/misc/Unsafe.class'])
+                    logv('[created/updated ' + unsafe_jar + ']')
+                except subprocess.CalledProcessError as e:
+                    abort('failed to compile ' + unsafe_source + ' or create ' + unsafe_jar + ': ' + str(e))
+                finally:
+                    shutil.rmtree(tmpdir)
             _classpath_append(unsafe_jar)
         if disableApiRestrictions:
             if jdk.javaCompliance < '9':
@@ -2704,7 +2735,7 @@ class JavacCompiler(JavacLikeCompiler):
 
                 if len(jdkModulesOnClassPath) != 0:
                     # We want annotation processors to use classes on the class path
-                    # instead of those the module(s) since the module classes may not
+                    # instead of those in module(s) since the module classes may not
                     # be in exported packages and/or may have different signatures.
                     # Unfortunately, there's no VM option for hiding modules, only the
                     # --limit-modules option for restricting modules observability.
@@ -5394,8 +5425,8 @@ class MavenRepo:
             release = versioning.find('release')
             versions = versioning.find('versions')
             versionStrings = [v.text for v in versions.iter('version')]
-            releaseVersionString = release.text if len(release) != 0 else None
-            if len(latest) != 0:
+            releaseVersionString = release.text if release is not None and len(release) != 0 else None
+            if latest is not None and len(latest) != 0:
                 latestVersionString = latest.text
             else:
                 logv('Element \'latest\' not specified in metadata. Fallback: Find latest via \'versions\'.')
@@ -5903,6 +5934,8 @@ class SuiteModel:
 
         if not exists(searchDir):
             return None
+
+        found = []
         for dd in os.listdir(searchDir):
             if suite_import.in_subdir:
                 candidate = join(searchDir, dd, suite_import.name)
@@ -5910,7 +5943,14 @@ class SuiteModel:
                 candidate = join(searchDir, dd)
             sd = _is_suite_dir(candidate, _mxDirName(suite_import.name))
             if sd is not None:
-                return sd
+                found.append(sd)
+
+        if len(found) == 0:
+            return None
+        elif len(found) == 1:
+            return found[0]
+        else:
+            abort("Multiple suites match the import {}:\n{}".format(suite_import.name, "\n".join(found)))
 
     def _check_exists(self, suite_import, path, check_alternate=True):
         if check_alternate and suite_import.urlinfos is not None and not exists(path):
@@ -10246,6 +10286,8 @@ def build(args, parser=None):
         if len(failed):
             for t in failed:
                 log_error('{0} failed'.format(t))
+            for daemon in daemons.itervalues():
+                daemon.shutdown()
             abort('{0} build tasks failed'.format(len(failed)))
 
     else:  # not parallelize
@@ -11315,14 +11357,17 @@ def _source_locator_memento(deps, jdk=None):
 
     javaCompliance = None
 
+    sources = []
     for dep in deps:
         if dep.isLibrary():
             if hasattr(dep, 'eclipse.container'):
                 memento = XMLDoc().element('classpathContainer', {'path' : getattr(dep, 'eclipse.container')}).xml(standalone='no')
                 slm.element('classpathContainer', {'memento' : memento, 'typeId':'org.eclipse.jdt.launching.sourceContainer.classpathContainer'})
+                sources.append(getattr(dep, 'eclipse.container') +' [classpathContainer]')
             elif dep.get_source_path(resolve=True):
                 memento = XMLDoc().element('archive', {'detectRoot' : 'true', 'path' : dep.get_source_path(resolve=True)}).xml(standalone='no')
                 slm.element('container', {'memento' : memento, 'typeId':'org.eclipse.debug.core.containerType.externalArchive'})
+                sources.append(dep.get_source_path(resolve=True) + ' [externalArchive]')
         elif dep.isJdkLibrary():
             if jdk is None:
                 jdk = get_jdk(tag='default')
@@ -11331,27 +11376,33 @@ def _source_locator_memento(deps, jdk=None):
                 if os.path.isdir(path):
                     memento = XMLDoc().element('directory', {'nest' : 'false', 'path' : path}).xml(standalone='no')
                     slm.element('container', {'memento' : memento, 'typeId':'org.eclipse.debug.core.containerType.directory'})
+                    sources.append(path + ' [directory]')
                 else:
                     memento = XMLDoc().element('archive', {'detectRoot' : 'true', 'path' : path}).xml(standalone='no')
                     slm.element('container', {'memento' : memento, 'typeId':'org.eclipse.debug.core.containerType.externalArchive'})
+                    sources.append(path + ' [externalArchive]')
         elif dep.isProject():
             if not dep.isJavaProject():
                 continue
             memento = XMLDoc().element('javaProject', {'name' : dep.name}).xml(standalone='no')
             slm.element('container', {'memento' : memento, 'typeId':'org.eclipse.jdt.launching.sourceContainer.javaProject'})
+            sources.append(dep.name + ' [javaProject]')
             if javaCompliance is None or dep.javaCompliance > javaCompliance:
                 javaCompliance = dep.javaCompliance
 
     if javaCompliance:
-        memento = XMLDoc().element('classpathContainer', {'path' : 'org.eclipse.jdt.launching.JRE_CONTAINER/org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType/JavaSE-' + str(javaCompliance)}).xml(standalone='no')
+        jdkContainer = 'org.eclipse.jdt.launching.JRE_CONTAINER/org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType/JavaSE-' + str(javaCompliance)
+        memento = XMLDoc().element('classpathContainer', {'path' : jdkContainer}).xml(standalone='no')
         slm.element('classpathContainer', {'memento' : memento, 'typeId':'org.eclipse.jdt.launching.sourceContainer.classpathContainer'})
+        sources.append(jdkContainer + ' [classpathContainer]')
     else:
         memento = XMLDoc().element('classpathContainer', {'path' : 'org.eclipse.jdt.launching.JRE_CONTAINER'}).xml(standalone='no')
         slm.element('classpathContainer', {'memento' : memento, 'typeId':'org.eclipse.jdt.launching.sourceContainer.classpathContainer'})
+        sources.append('org.eclipse.jdt.launching.JRE_CONTAINER [classpathContainer]')
 
     slm.close('sourceContainers')
     slm.close('sourceLookupDirector')
-    return slm
+    return slm, sources
 
 def make_eclipse_attach(suite, hostname, port, name=None, deps=None, jdk=None):
     """
@@ -11359,7 +11410,11 @@ def make_eclipse_attach(suite, hostname, port, name=None, deps=None, jdk=None):
     """
     if deps is None:
         deps = []
-    slm = _source_locator_memento(deps, jdk=jdk)
+    slm, sources = _source_locator_memento(deps, jdk=jdk)
+    # Without an entry for the "Project:" field in an attach configuration, Eclipse Neon has problems connecting
+    # to a waiting VM and leaves it hanging. Putting any valid project entry in the field seems to solve it.
+    firstProjectName = suite.projects[0].name if suite.projects else ''
+
     launch = XMLDoc()
     launch.open('launchConfiguration', {'type' : 'org.eclipse.jdt.launching.remoteJavaApplication'})
     launch.element('stringAttribute', {'key' : 'org.eclipse.debug.core.source_locator_id', 'value' : 'org.eclipse.jdt.launching.sourceLocator.JavaSourceLookupDirector'})
@@ -11369,7 +11424,7 @@ def make_eclipse_attach(suite, hostname, port, name=None, deps=None, jdk=None):
     launch.element('mapEntry', {'key' : 'hostname', 'value' : hostname})
     launch.element('mapEntry', {'key' : 'port', 'value' : port})
     launch.close('mapAttribute')
-    launch.element('stringAttribute', {'key' : 'org.eclipse.jdt.launching.PROJECT_ATTR', 'value' : ''})
+    launch.element('stringAttribute', {'key' : 'org.eclipse.jdt.launching.PROJECT_ATTR', 'value' : firstProjectName})
     launch.element('stringAttribute', {'key' : 'org.eclipse.jdt.launching.VM_CONNECTOR_ID', 'value' : 'org.eclipse.jdt.launching.socketAttachConnector'})
     launch.close('launchConfiguration')
     launch = launch.xml(newl='\n', standalone='no') % slm.xml(escape=True, standalone='no')
@@ -11383,6 +11438,8 @@ def make_eclipse_attach(suite, hostname, port, name=None, deps=None, jdk=None):
     eclipseLaunches = join(suite.mxDir, 'eclipse-launches')
     ensure_dir_exists(eclipseLaunches)
     launchFile = join(eclipseLaunches, name + '.launch')
+    sourcesFile = join(eclipseLaunches, name + '.sources')
+    update_file(sourcesFile, '\n'.join(sources))
     return update_file(launchFile, launch), launchFile
 
 def make_eclipse_launch(suite, javaArgs, jre, name=None, deps=None):
@@ -11433,7 +11490,7 @@ def make_eclipse_launch(suite, javaArgs, jre, name=None, deps=None):
                 deps += [p for p in s.projects if e == p.output_dir()]
                 deps += [l for l in s.libs if e == l.get_path(False)]
 
-    slm = _source_locator_memento(deps)
+    slm, sources = _source_locator_memento(deps)
 
     launch = XMLDoc()
     launch.open('launchConfiguration', {'type' : 'org.eclipse.jdt.launching.localJavaApplication'})
@@ -11449,7 +11506,10 @@ def make_eclipse_launch(suite, javaArgs, jre, name=None, deps=None):
 
     eclipseLaunches = join(suite.mxDir, 'eclipse-launches')
     ensure_dir_exists(eclipseLaunches)
-    return update_file(join(eclipseLaunches, name + '.launch'), launch)
+    launchFile = join(eclipseLaunches, name + '.launch')
+    sourcesFile = join(eclipseLaunches, name + '.sources')
+    update_file(sourcesFile, '\n'.join(sources))
+    return update_file(launchFile, launch)
 
 def eclipseinit_cli(args):
     """(re)generate Eclipse project configurations and working sets"""
@@ -11937,23 +11997,8 @@ def _eclipseinit_project(p, files=None, libFiles=None, absolutePaths=False):
     if files:
         files.append(projectFile)
 
-    settingsDir = join(p.dir, ".settings")
-    ensure_dir_exists(settingsDir)
-
     # copy a possibly modified file to the project's .settings directory
-    for name, sources in p.eclipse_settings_sources().iteritems():
-        out = StringIO.StringIO()
-        print >> out, '# GENERATED -- DO NOT EDIT'
-        for source in sources:
-            print >> out, '# Source:', source
-            with open(source) as f:
-                print >> out, f.read()
-        content = out.getvalue().replace('${javaCompliance}', str(eclipseJavaCompliance))
-        if processors:
-            content = content.replace('org.eclipse.jdt.core.compiler.processAnnotations=disabled', 'org.eclipse.jdt.core.compiler.processAnnotations=enabled')
-        update_file(join(settingsDir, name), content)
-        if files:
-            files.append(join(settingsDir, name))
+    _copy_eclipse_settings(p, files)
 
     if processors:
         out = XMLDoc()
@@ -12650,6 +12695,8 @@ def _netbeansinit_project(p, jdks=None, files=None, libFiles=None, dists=None):
         apSourceOutRef = ""
     ensure_dir_exists(p.output_dir())
 
+    _copy_eclipse_settings(p)
+
     content = """
 annotation.processing.enabled=""" + annotationProcessorEnabled + """
 annotation.processing.enabled.in.editor=""" + annotationProcessorEnabled + """
@@ -12658,6 +12705,18 @@ annotation.processing.processors.list=
 annotation.processing.run.all.processors=true
 application.title=""" + p.name + """
 application.vendor=mx
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.eclipseFormatterActiveProfile=
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.eclipseFormatterEnabled=true
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.eclipseFormatterLocation=
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.enableFormatAsSaveAction=true
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.linefeed=
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.preserveBreakPoints=true
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.SaveActionModifiedLinesOnly=false
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.showNotifications=false
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.sourcelevel=
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.useProjectPref=true
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.useProjectSettings=true
+auxiliary.de-markiewb-netbeans-plugins-eclipse-formatter.eclipseFormatterActiveProfile=
 auxiliary.org-netbeans-spi-editor-hints-projects.perProjectHintSettingsEnabled=true
 auxiliary.org-netbeans-spi-editor-hints-projects.perProjectHintSettingsFile=nbproject/cfg_hints.xml
 build.classes.dir=${build.dir}
@@ -14758,7 +14817,7 @@ def maven_install(args):
         only = args.only.split(',')
     for dist in s.dists:
         # ignore non-exported dists
-        if not dist.internal and not dist.name.startswith('COM_ORACLE') and dist.maven:
+        if not dist.internal and not dist.name.startswith('COM_ORACLE') and hasattr(dist, 'maven') and dist.maven:
             if len(only) is 0 or dist.name in only:
                 arcdists.append(dist)
 
@@ -14780,6 +14839,31 @@ def maven_install(args):
         print 'name: ' + _map_to_maven_dist_name(mxMetaName) + ', path: ' + os.path.relpath(mxMetaJar, s.dir)
         for dist in arcdists:
             print 'name: ' + _map_to_maven_dist_name(dist.name) + ', path: ' + os.path.relpath(dist.path, s.dir)
+
+def _copy_eclipse_settings(p, files=None):
+    eclipseJavaCompliance = _convert_to_eclipse_supported_compliance(p.javaCompliance)
+    processors = p.annotation_processors()
+
+    settingsDir = join(p.dir, ".settings")
+    ensure_dir_exists(settingsDir)
+
+    for name, sources in p.eclipse_settings_sources().iteritems():
+        out = StringIO.StringIO()
+        print >> out, '# GENERATED -- DO NOT EDIT'
+        for source in sources:
+            print >> out, '# Source:', source
+            with open(source) as f:
+                print >> out, f.read()
+        if eclipseJavaCompliance:
+            content = out.getvalue().replace('${javaCompliance}', str(eclipseJavaCompliance))
+        else:
+            content = out.getvalue()
+        if processors:
+            content = content.replace('org.eclipse.jdt.core.compiler.processAnnotations=disabled', 'org.eclipse.jdt.core.compiler.processAnnotations=enabled')
+        update_file(join(settingsDir, name), content)
+        if files:
+            files.append(join(settingsDir, name))
+
 
 def ensure_dir_exists(path, mode=None):
     """
@@ -15385,7 +15469,7 @@ def _discover_suites(primary_suite_dir, load=True, register=True, update_existin
     def _was_cloned_or_updated_during_discovery(_discovered_suite):
         return _discovered_suite.vc_dir is not None and _discovered_suite.vc_dir in original_version
 
-    def _update_repo(_discovered_suite, update_version, forget=False):
+    def _update_repo(_discovered_suite, update_version, forget=False, update_reason="to resolve conflict"):
         current_version = _discovered_suite.vc.parent(_discovered_suite.vc_dir)
         if current_version == update_version:
             return False
@@ -15400,7 +15484,7 @@ def _discover_suites(primary_suite_dir, load=True, register=True, update_existin
         if forget:
             # we updated, this may change the DAG so
             # "un-discover" anything that was discovered based on old information
-            _log_discovery("Updated needed to resolve conflict: updating {} to {}".format(_discovered_suite.vc_dir, update_version))
+            _log_discovery("Updated needed {}: updating {} to {}".format(update_reason, _discovered_suite.vc_dir, update_version))
             forgotten_edges = {}
 
             def _forget_visitor(_, __suite_import):
@@ -15409,7 +15493,7 @@ def _discover_suites(primary_suite_dir, load=True, register=True, update_existin
             def _forget_suite(suite_name):
                 if suite_name not in discovered:
                     return
-                _log_discovery("Forgetting {} after conflict".format(suite_name))
+                _log_discovery("Forgetting {} after update".format(suite_name))
                 if suite_name in ancestor_names:
                     del ancestor_names[suite_name]
                 if suite_name in importer_names:
@@ -15555,16 +15639,18 @@ def _discover_suites(primary_suite_dir, load=True, register=True, update_existin
                     original_version[discovered_suite.vc_dir] = VersionType.CLONED, None
                 elif discovered_suite.vc_dir in vc_dir_to_suite_names and not vc_dir_to_suite_names[discovered_suite.vc_dir]:
                     # we re-discovered a suite that we had cloned and then "un-discovered".
-                    if suite_import.version and _update_repo(discovered_suite, suite_import.version):
-                        _log_discovery("This is a re-discovery of a previously cloned suite: updating {} to {}".format(discovered_suite.vc_dir, suite_import.version))
+                    if suite_import.version and _update_repo(discovered_suite, suite_import.version, update_reason="(re-discovery of un-discovered suite)"):
+                        _log_discovery("This is a re-discovery of a previously cloned suite: updated {} to {}".format(discovered_suite.vc_dir, suite_import.version))
                 elif _was_cloned_or_updated_during_discovery(discovered_suite):
                     # we are re-reaching a repo through a different imported suite
                     _add_discovered_suite(discovered_suite, importing_suite.name)
                     _check_and_handle_version_conflict(suite_import, importing_suite, discovered_suite)
                     continue
-                elif update_existing and suite_import.version and _update_repo(discovered_suite, suite_import.version):
-                    _log_discovery("Updating {} after discovery (`update_existing` mode) to {}".format(discovered_suite.vc_dir, suite_import.version))
-
+                elif update_existing and suite_import.version:
+                    _add_discovered_suite(discovered_suite, importing_suite.name)
+                    if _update_repo(discovered_suite, suite_import.version, forget=True, update_reason="(update_existing mode)"):
+                        _log_discovery("Updated {} after discovery (`update_existing` mode) to {}".format(discovered_suite.vc_dir, suite_import.version))
+                    continue
                 _add_discovered_suite(discovered_suite, importing_suite.name)
     except SystemExit as se:
         cloned_during_discovery = [d for d, (t, _) in original_version.items() if t == VersionType.CLONED]
@@ -15740,7 +15826,7 @@ def main():
         abort(1, killsig=signal.SIGINT)
 
 # The comment after VersionSpec should be changed in a random manner for every bump to force merge conflicts!
-version = VersionSpec("5.113.0")  # Furry Enemy
+version = VersionSpec("5.114.8")  # Green balance
 
 currentUmask = None
 _mx_start_datetime = datetime.utcnow()
